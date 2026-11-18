@@ -293,7 +293,7 @@
 
     <div class="hand-cursor" id="handCursor" aria-hidden="true">
       <span class="cursor-dot"></span>
-      <span class="cursor-label" id="cursorLabel">POINT / PINCH</span>
+      <span class="cursor-label" id="cursorLabel">GATHER / FIST</span>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -2480,13 +2480,19 @@
     ];
 
     const TASKS_VERSION = '0.10.14';
-    const TASKS_MODULE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/vision_bundle.mjs`;
-    const TASKS_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}/wasm`;
+    const TASKS_BASES = [
+      `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}`,
+      `https://fastly.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}`,
+      `https://unpkg.com/@mediapipe/tasks-vision@${TASKS_VERSION}`,
+    ];
+    const TASKS_MODULES = TASKS_BASES.map((base) => `${base}/vision_bundle.mjs`);
+    const TASKS_WASM_SOURCES = TASKS_BASES.slice(0, 2).map((base) => `${base}/wasm`);
     // Google Storage is not reachable from many networks. Prefer mirrored
     // task files on jsDelivr, then fall back to the original source.
     const HAND_MODEL_SOURCES = [
       'https://cdn.jsdelivr.net/gh/faunris/ai-hand-tracking@main/data/hand_landmarker.task',
       'https://fastly.jsdelivr.net/gh/faunris/ai-hand-tracking@main/data/hand_landmarker.task',
+      'https://raw.githubusercontent.com/faunris/ai-hand-tracking/main/data/hand_landmarker.task',
       'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
     ];
 
@@ -2700,22 +2706,63 @@
       }
     }
 
+    function timeoutAfter(ms, message) {
+      return new Promise((_, reject) => {
+        window.setTimeout(() => reject(new Error(message)), ms);
+      });
+    }
+
+    async function importTasksVision() {
+      let lastError = null;
+      for (const url of TASKS_MODULES) {
+        try {
+          return await Promise.race([
+            import(url),
+            timeoutAfter(10000, 'Hand module timeout'),
+          ]);
+        } catch (error) {
+          lastError = error;
+          console.warn('Hand module source failed:', url, error);
+        }
+      }
+      throw lastError || new Error('Hand module could not be loaded');
+    }
+
+    async function resolveFileset(vision) {
+      let lastError = null;
+      for (const base of TASKS_WASM_SOURCES) {
+        try {
+          return await Promise.race([
+            vision.FilesetResolver.forVisionTasks(base),
+            timeoutAfter(18000, 'Hand WASM timeout'),
+          ]);
+        } catch (error) {
+          lastError = error;
+          console.warn('Hand WASM source failed:', base, error);
+        }
+      }
+      throw lastError || new Error('Hand WASM could not be loaded');
+    }
+
     async function createLandmarker(vision, delegate) {
-      const fileset = await vision.FilesetResolver.forVisionTasks(TASKS_WASM);
+      const fileset = await resolveFileset(vision);
       let lastError = null;
       for (const modelAssetPath of HAND_MODEL_SOURCES) {
         try {
-          return await vision.HandLandmarker.createFromOptions(fileset, {
-            baseOptions: {
-              modelAssetPath,
-              delegate,
-            },
-            runningMode: 'VIDEO',
-            numHands: 1,
-            minHandDetectionConfidence: 0.58,
-            minHandPresenceConfidence: 0.58,
-            minTrackingConfidence: 0.58,
-          });
+          return await Promise.race([
+            vision.HandLandmarker.createFromOptions(fileset, {
+              baseOptions: {
+                modelAssetPath,
+                delegate,
+              },
+              runningMode: 'VIDEO',
+              numHands: 1,
+              minHandDetectionConfidence: 0.58,
+              minHandPresenceConfidence: 0.58,
+              minTrackingConfidence: 0.58,
+            }),
+            timeoutAfter(30000, 'Hand model timeout'),
+          ]);
         } catch (error) {
           lastError = error;
           console.warn('Hand model source failed:', modelAssetPath, error);
@@ -2738,16 +2785,12 @@
       const startToken = ++handState.startToken;
       handState.loading = true;
       updateCameraButton(false, true);
-      setHandReadout('Opening hand link');
-      let landmarkerPromise = null;
+      setHandReadout('Requesting camera');
       let streamPromise = null;
+      let stream = null;
       try {
-        const vision = await import(TASKS_MODULE);
-        let timeoutHandle = 0;
-        landmarkerPromise = createLandmarker(vision, 'GPU').catch((error) => {
-          console.warn('GPU hand tracking unavailable, using CPU:', error);
-          return createLandmarker(vision, 'CPU');
-        });
+        // Ask for the camera before touching any CDN. This guarantees the
+        // browser permission prompt appears even when the model network is slow.
         streamPromise = navigator.mediaDevices.getUserMedia({
           audio: false,
           video: {
@@ -2756,11 +2799,30 @@
             height: { ideal: 720 },
           },
         });
-        const timeout = new Promise((_, reject) => {
-          timeoutHandle = window.setTimeout(() => reject(new Error('Hand link timed out')), 28000);
-        });
-        const [landmarker, stream] = await Promise.race([Promise.all([landmarkerPromise, streamPromise]), timeout]);
-        window.clearTimeout(timeoutHandle);
+        stream = await Promise.race([
+          streamPromise,
+          timeoutAfter(45000, 'Camera request timed out'),
+        ]);
+        if (startToken !== handState.startToken) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        handState.stream = stream;
+        ui.handVideo.srcObject = stream;
+        await ui.handVideo.play();
+        ui.handPanel.classList.add('active');
+        setHandReadout('Camera live - loading hand model');
+        showToast('Camera ready - loading hand model');
+
+        const vision = await importTasksVision();
+        const landmarker = await Promise.race([
+          createLandmarker(vision, 'GPU').catch((error) => {
+            console.warn('GPU hand tracking unavailable, using CPU:', error);
+            return createLandmarker(vision, 'CPU');
+          }),
+          timeoutAfter(90000, 'Hand link timed out'),
+        ]);
 
         if (startToken !== handState.startToken) {
           try { landmarker.close(); } catch (error) { console.warn(error); }
@@ -2769,30 +2831,22 @@
         }
 
         handState.landmarker = landmarker;
-        handState.stream = stream;
-        ui.handVideo.srcObject = stream;
-        await ui.handVideo.play();
-
         handState.active = true;
         handState.loading = false;
         handState.activatedAt = performance.now();
         handState.lastVideoTime = -1;
         handState.startToken += 1;
-        ui.handPanel.classList.add('active');
         updateCameraButton(true, false);
         setHandReadout('Show your hand');
         showToast('Hand link ready - show your palm');
       } catch (error) {
         if (startToken !== handState.startToken) return;
         console.error('Hand tracking could not start:', error);
-        if (landmarkerPromise) {
-          landmarkerPromise.then((pendingLandmarker) => {
-            try { pendingLandmarker.close(); } catch (closeError) { console.warn(closeError); }
-          }).catch(() => {});
-        }
         if (streamPromise) {
           streamPromise.then((pendingStream) => {
-            pendingStream.getTracks().forEach((track) => track.stop());
+            if (pendingStream !== handState.stream) {
+              pendingStream.getTracks().forEach((track) => track.stop());
+            }
           }).catch(() => {});
         }
         handState.loading = false;
@@ -2802,13 +2856,16 @@
         updateCameraButton(false, false);
         setHandReadout('Hand link unavailable');
         const denied = error && (error.name === 'NotAllowedError' || error.name === 'SecurityError');
-        const timedOut = error && error.message === 'Hand link timed out';
+        const cameraTimedOut = error && error.message === 'Camera request timed out';
+        const modelFailed = error && /Hand (module|WASM|model|link)/i.test(error.message || '');
         showToast(
           denied
             ? 'Camera permission is needed for hand control'
-            : timedOut
-              ? 'Hand link is taking too long - retry, or use the dock below'
-              : 'Hand link unavailable - the gesture dock still works'
+            : cameraTimedOut
+              ? 'Camera did not start - close other camera apps and retry'
+              : modelFailed
+                ? 'Camera works, but the hand model failed to load - check network and retry'
+                : 'Hand link unavailable - the gesture dock still works'
         );
       }
     }
@@ -3093,4 +3150,4 @@
   </script>
 
 
-<div id="el-popper-container-9271"></div><script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm/vision_wasm_internal.js" crossorigin="anonymous"></script></body></html>
+<div id="el-popper-container-844"></div><script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm/vision_wasm_internal.js" crossorigin="anonymous"></script><script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm/vision_wasm_internal.js" crossorigin="anonymous"></script></body></html>
